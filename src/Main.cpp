@@ -47,6 +47,19 @@ static void showAbout();
 
 static LRESULT CALLBACK KeyboardProc(int ncode, WPARAM wparam, LPARAM lparam);
 
+struct Selection {
+	int caret;
+	int anchor;
+
+	Selection(int caret, int anchor) : caret(caret), anchor(anchor) {}
+
+	int start() const { return min(caret, anchor); }
+	int end() const { return max(caret, anchor); }
+	int length() const { return end() - start(); }
+	void set(int pos) { anchor = caret = pos; }
+	void offset(int offset) { anchor += offset; caret += offset; }
+};
+
 static FuncItem funcItem[] = {
 	{ TEXT("Enable"), enableBetterMultiSelection, 0, false, nullptr },
 	{ TEXT(""), nullptr, 0, false, nullptr },
@@ -87,7 +100,176 @@ static HWND GetCurrentScintilla() {
 	return (which == 0) ? nppData._scintillaMainHandle : nppData._scintillaSecondHandle;
 }
 
-#include "../qt/SelectionCore.h"
+static std::vector<Selection> GetSelections() {
+	std::vector<Selection> selections;
+
+	int num = editor.GetSelections();
+	for (int i = 0; i < num; ++i) {
+		int caret = editor.GetSelectionNCaret(i);
+		int anchor = editor.GetSelectionNAnchor(i);
+		selections.emplace_back(Selection{ caret, anchor });
+	}
+
+	return selections;
+}
+
+static void SetSelections(const std::vector<Selection> &selections) {
+	for (size_t i = 0; i < selections.size(); ++i) {
+		if (i == 0)
+			editor.SetSelection(selections[i].caret, selections[i].anchor);
+		else
+			editor.AddSelection(selections[i].caret, selections[i].anchor);
+	}
+}
+
+template<typename It>
+It uniquify(It begin, It const end)
+{
+	std::vector<It> v;
+	v.reserve(static_cast<size_t>(std::distance(begin, end)));
+
+	for (It i = begin; i != end; ++i)
+		v.push_back(i);
+
+	std::sort(v.begin(), v.end(), [](const auto &lhs, const auto &rhs) {
+		return (*lhs).start() < (*rhs).start() || (!((*rhs).start() < (*lhs).start()) && (*lhs).end() < (*rhs).end());
+	});
+
+	v.erase(std::unique(v.begin(), v.end(), [](const auto &lhs, const auto &rhs) {
+		return (*lhs).start() == (*rhs).start() && (*lhs).end() == (*rhs).end();
+	}), v.end());
+
+	std::sort(v.begin(), v.end());
+
+	size_t j = 0;
+	for (It i = begin; i != end && j != v.size(); ++i) {
+		if (i == v[j]) {
+			using std::iter_swap; iter_swap(i, begin);
+			++j;
+			++begin;
+		}
+	}
+	return begin;
+}
+
+// Create a closure that simply calls a SCI_XXX message
+static auto SimpleEdit(int message) {
+	return [message](Selection &selection) {
+		editor.SetSelection(selection.caret, selection.anchor);
+		editor.Call(message);
+
+		selection.caret = editor.GetSelectionNCaret(0);
+		selection.anchor = editor.GetSelectionNAnchor(0);
+	};
+}
+
+template<typename T>
+static void EditSelections(T edit) {
+	auto selections = GetSelections();
+
+	editor.ClearSelections();
+
+	std::sort(selections.begin(), selections.end(), [](const auto &lhs, const auto &rhs) {
+		return lhs.start() < rhs.start() || (!(rhs.start() < lhs.start()) && lhs.end() < rhs.end());
+	});
+
+	editor.BeginUndoAction();
+
+	int totalOffset = 0;
+	for (auto &selection : selections) {
+		selection.offset(totalOffset);
+		const int length = editor.GetLength();
+
+		edit(selection);
+
+		totalOffset += editor.GetLength() - length;
+	}
+
+	editor.EndUndoAction();
+
+	selections.erase(uniquify(selections.begin(), selections.end()), selections.end());
+
+	SetSelections(selections);
+}
+
+std::string TransformLineEnds(const char *s, int eolModeWanted) {
+	std::string dest;
+	const size_t len = strlen(s);
+	for (size_t i = 0; s[i]; i++) {
+		if (s[i] == '\n' || s[i] == '\r') {
+			if (eolModeWanted == SC_EOL_CR) {
+				dest.push_back('\r');
+			}
+			else if (eolModeWanted == SC_EOL_LF) {
+				dest.push_back('\n');
+			}
+			else { // eolModeWanted == SC_EOL_CRLF
+				dest.push_back('\r');
+				dest.push_back('\n');
+			}
+			if ((s[i] == '\r') && (i + 1 < len) && (s[i + 1] == '\n')) {
+				i++;
+			}
+		}
+		else {
+			dest.push_back(s[i]);
+		}
+	}
+	return dest;
+}
+
+const char *StringFromEOLMode(int eolMode) {
+	if (eolMode == SC_EOL_CRLF) {
+		return "\r\n";
+	}
+	else if (eolMode == SC_EOL_CR) {
+		return "\r";
+	}
+	else {
+		return "\n";
+	}
+}
+
+template <typename T, typename U>
+static std::string join(const std::vector<T> &v, const U &delim) {
+	std::stringstream ss;
+	for (size_t i = 0; i < v.size(); ++i) {
+		if (i != 0) ss << delim;
+		ss << v[i];
+	}
+	return ss.str();
+}
+
+template <typename T>
+static std::vector<std::basic_string<T>> split(std::basic_string<T> const &str, const std::basic_string<T> &delim) {
+	size_t start;
+	size_t end = 0;
+	std::vector<std::basic_string<T>> out;
+
+	while ((start = str.find_first_not_of(delim, end)) != std::basic_string<T>::npos) {
+		end = str.find(delim, start);
+		out.push_back(str.substr(start, end - start));
+	}
+
+	return out;
+}
+
+bool AllSelectionsHaveText(ScintillaEditor &editor) {
+	const int selections = editor.GetSelections();
+	bool has_selections = true;
+
+	for (int i = 0; i < editor.GetSelections(); ++i) {
+		int start = editor.GetSelectionNStart(i);
+		int end = editor.GetSelectionNEnd(i);
+
+		if (start == end) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 // ============================================================================
 
 // OpenClipboard may fail if another application has opened the clipboard.
@@ -105,7 +287,38 @@ bool OpenClipboardRetry(HWND hwnd) {
 	return false;
 }
 
-#include "../qt/CodePageCore.h"
+UINT CodePageFromCharSet(DWORD characterSet, UINT documentCodePage) {
+	if (documentCodePage == SC_CP_UTF8) {
+		return SC_CP_UTF8;
+	}
+	switch (characterSet) {
+	case SC_CHARSET_ANSI: return 1252;
+	case SC_CHARSET_DEFAULT: return documentCodePage ? documentCodePage : 1252;
+	case SC_CHARSET_BALTIC: return 1257;
+	case SC_CHARSET_CHINESEBIG5: return 950;
+	case SC_CHARSET_EASTEUROPE: return 1250;
+	case SC_CHARSET_GB2312: return 936;
+	case SC_CHARSET_GREEK: return 1253;
+	case SC_CHARSET_HANGUL: return 949;
+	case SC_CHARSET_MAC: return 10000;
+	case SC_CHARSET_OEM: return 437;
+	case SC_CHARSET_RUSSIAN: return 1251;
+	case SC_CHARSET_SHIFTJIS: return 932;
+	case SC_CHARSET_TURKISH: return 1254;
+	case SC_CHARSET_JOHAB: return 1361;
+	case SC_CHARSET_HEBREW: return 1255;
+	case SC_CHARSET_ARABIC: return 1256;
+	case SC_CHARSET_VIETNAMESE: return 1258;
+	case SC_CHARSET_THAI: return 874;
+	case SC_CHARSET_8859_15: return 28605;
+		// Not supported
+	case SC_CHARSET_CYRILLIC: return documentCodePage;
+	case SC_CHARSET_SYMBOL: return documentCodePage;
+	}
+	return documentCodePage;
+}
+
+
 // This is a modificated version of ScintillaWin::CopyToClipboard()
 // Multilpe selects can be treated like rectangular and concat'ed together by newlines
 bool CopyToClipboard(ScintillaEditor &editor) {
@@ -174,7 +387,39 @@ UINT CodePageOfDocument(ScintillaEditor &editor) {
 	return CodePageFromCharSet(editor.StyleGetCharacterSet(STYLE_DEFAULT), editor.GetCodePage());
 }
 
-#include "../qt/PasteCore.h"
+bool InsertMultiCursorPaste(ScintillaEditor &editor, const char *text) {
+	std::string st;
+
+	if (editor.GetPasteConvertEndings()) {
+		st = TransformLineEnds(text, editor.GetEOLMode());
+	}
+	else {
+		st = text;
+	}
+
+	auto lines = split(st, std::string(StringFromEOLMode(editor.GetEOLMode())));
+	if (lines.size() == editor.GetSelections()) {
+		EditSelections([&lines, &editor](Selection &selection) {
+			if (selection.caret < selection.anchor)
+				editor.SetTargetRange(selection.caret, selection.anchor);
+			else
+				editor.SetTargetRange(selection.anchor, selection.caret);
+
+			editor.ReplaceTarget(lines[0]);
+
+			selection.caret = editor.GetTargetEnd();
+			selection.anchor = editor.GetTargetEnd();
+
+			// pop front
+			lines.erase(lines.cbegin());
+		});
+
+		return true;
+	}
+
+	return false;
+}
+
 bool Paste(ScintillaEditor &editor) {
 	if (!IsClipboardFormatAvailable(cfColumnSelect) && !IsClipboardFormatAvailable(cfMultiSelect))
 		return false;
@@ -259,12 +504,101 @@ bool Paste(ScintillaEditor &editor) {
 	return false;
 }
 
-#include "../qt/KeyboardCore.h"
 LRESULT CALLBACK KeyboardProc(int ncode, WPARAM wparam, LPARAM lparam) {
-    if(ncode==HC_ACTION && (HIWORD(lparam)&KF_UP)==0 && !IsAltPressed() && hasFocus
-        && HandleKey(static_cast<int>(wparam),IsControlPressed(),IsShiftPressed())) return TRUE;
-    return CallNextHookEx(hook,ncode,wparam,lparam);
+	if (ncode == HC_ACTION && (HIWORD(lparam) & KF_UP) == 0 && !IsAltPressed()) {
+		if (hasFocus && editor.GetSelections() > 1) {
+			if (IsControlPressed()) {
+				if (wparam == VK_LEFT) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_WORDLEFTEXTEND : SCI_WORDLEFT));
+					return TRUE; // This key has been "handled" and won't propogate
+				}
+				else if (wparam == VK_RIGHT) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_WORDRIGHTENDEXTEND : SCI_WORDRIGHT));
+					return TRUE;
+				}
+				else if (!IsShiftPressed()) { // Handle CTRL+{} only, allow CTRL+SHIFT+{} to be used elsewhere
+					if (wparam == VK_BACK) {
+						EditSelections(SimpleEdit(SCI_DELWORDLEFT));
+						return TRUE;
+					}
+					else if (wparam == VK_DELETE) {
+						EditSelections(SimpleEdit(SCI_DELWORDRIGHT));
+						return TRUE;
+					}
+					else if (wparam == 'X' || wparam == 'C') {
+						if (CopyToClipboard(editor)) {
+							if (wparam == 'X') {
+								EditSelections(SimpleEdit(SCI_DELETEBACK));
+							}
+							return TRUE;
+						}
+					}
+					else if (wparam == 'V') {
+						if (Paste(editor)) {
+							return TRUE;
+						}
+					}
+				}
+			}
+			else {
+				if (wparam == VK_ESCAPE) {
+					int caret = editor.GetSelectionNCaret(editor.GetMainSelection());
+					editor.SetSelection(caret, caret);
+					return TRUE;
+				}
+				else if (wparam == VK_LEFT) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_CHARLEFTEXTEND : SCI_CHARLEFT));
+					return TRUE;
+				}
+				else if (wparam == VK_RIGHT) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_CHARRIGHTEXTEND : SCI_CHARRIGHT));
+					return TRUE;
+				}
+				else if (wparam == VK_HOME) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_VCHOMEWRAPEXTEND : SCI_VCHOMEWRAP));
+					return TRUE;
+				}
+				else if (wparam == VK_END) {
+					EditSelections(SimpleEdit(IsShiftPressed() ? SCI_LINEENDWRAPEXTEND : SCI_LINEENDWRAP));
+					return TRUE;
+				}
+				else if (wparam == VK_BACK) {
+					EditSelections(SimpleEdit(SCI_DELETEBACK));
+					return TRUE;
+				}
+				else if (wparam == VK_DELETE) {
+					EditSelections(SimpleEdit(SCI_CLEAR));
+					return TRUE;
+				}
+				else if (wparam == VK_RETURN) {
+					if (!editor.AutoCActive()) {
+						EditSelections(SimpleEdit(SCI_NEWLINE));
+						return TRUE;
+					}
+					// else just let Scintilla handle the insertion of autocompletion
+				}
+				else if (wparam == VK_UP) {
+					if (!editor.AutoCActive()) {
+						EditSelections(SimpleEdit(IsShiftPressed() ? SCI_LINEUPEXTEND : SCI_LINEUP));
+						return TRUE;
+					}
+					// else just let Scintilla handle the navigation of autocompletion
+				}
+				else if (wparam == VK_DOWN) {
+					if (!editor.AutoCActive()) {
+						EditSelections(SimpleEdit(IsShiftPressed() ? SCI_LINEDOWNEXTEND : SCI_LINEDOWN));
+						return TRUE;
+					}
+					// else just let Scintilla handle the navigation of autocompletion
+				}
+			}
+		}
+	}
+
+	return CallNextHookEx(hook, ncode, wparam, lparam); // pass control to next hook in the hook chain
 }
+
+
 BOOL APIENTRY DllMain(HANDLE hModule, DWORD  reasonForCall, LPVOID lpReserved) {
 	switch (reasonForCall) {
 		case DLL_PROCESS_ATTACH:
